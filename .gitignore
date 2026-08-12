@@ -1,0 +1,20 @@
+# Per-user / legacy runtime configuration
+config.json
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Local build / release output
+dist/
+build/
+*.zip
