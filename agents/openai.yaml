@@ -1,0 +1,7 @@
+interface:
+  display_name: "StereoNote"
+  short_description: "Operate an open DCS/StereoNote workspace"
+  default_prompt: "Use $stereonote to connect to the DCS/StereoNote URL I provide and perform the requested operation."
+
+policy:
+  allow_implicit_invocation: false
