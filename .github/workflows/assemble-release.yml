@@ -1,0 +1,42 @@
+name: assemble-release-sources
+
+on:
+  push:
+    paths:
+      - '.publish/**'
+      - '.github/workflows/assemble-release.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  assemble:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Assemble and verify sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p scripts tests
+          cat .publish/sn.gz.b64.part* | base64 --decode | gzip -dc > scripts/sn.py
+          cat .publish/test.gz.b64.part* | base64 --decode | gzip -dc > tests/test_sn.py
+          echo 'b91f2d4623b0fef3a765792cbbe2fc120a4fd70a8942d9b5f993ed58154afcee  scripts/sn.py' | sha256sum -c -
+          echo '44f2f31f5da89ed766942b47ab566722466af88c8cef7b33b5cd204b8a451bbd  tests/test_sn.py' | sha256sum -c -
+          python -m compileall -q scripts tests
+          python -m pip install -r requirements.txt
+          python -m unittest discover -s tests -v
+          node --check scripts/jupyter_runtime.js
+      - name: Commit clean release tree
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf .publish
+          rm -f .github/workflows/assemble-release.yml
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git commit -m 'build: assemble v3.2.1 release sources'
+          git push
