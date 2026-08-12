@@ -1,0 +1,5 @@
+{
+  "session": "stereonote",
+  "work_root": "/data/work",
+  "daemon_url": "http://127.0.0.1:10086"
+}
