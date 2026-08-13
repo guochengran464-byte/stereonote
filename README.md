@@ -27,6 +27,27 @@ DCS/StereoNote 服务器本身仍是 Linux 环境。
 
 ## 安装
 
+### 0. 首次安装 Kimi WebBridge
+
+如果电脑上还没有 Kimi WebBridge，请先完成 WebBridge 安装，再安装/使用 StereoNote Skill。
+
+完整图文步骤与故障排查见：
+
+**[Kimi WebBridge 安装指南（Windows + Edge）](docs/KIMI_WEBBRIDGE_INSTALL.md)**
+
+最短流程是：
+
+1. 从 Kimi 官方 WebBridge 页面安装 **Windows + Edge + Local Agent** 组件；
+2. 确认 Kimi WebBridge 扩展安装在你登录 DCS/StereoNote 的**同一个 Edge profile**；
+3. 确认本地桥接程序可用；
+4. 安装 StereoNote 后运行：
+
+```bash
+python scripts/sn.py doctor
+```
+
+当前公开 smoke test 已验证 **Kimi WebBridge v1.11.1** 可完成 StereoNote 的核心连接流程。升级 WebBridge 后建议先在非生产 workspace 重新运行 `doctor` 和最小 smoke test。
+
 ### 1. 安装 Python 依赖
 
 ```bash
