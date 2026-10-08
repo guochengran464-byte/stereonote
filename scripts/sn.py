@@ -9,10 +9,9 @@ Go daemon (HTTP POST /command) -> CDP -> the inner.dcs.cloud JupyterLab iframe
 v3 changes vs the original skill:
   * self-healing daemon:   auto-start the Go daemon, clear a stale pid file,
                            wait for the extension to reconnect.
-  * navigate-based entry:  `find_tab active` (borrowing a pre-existing tab) does
-                           NOT work with this extension build, so we `navigate`
-                           to the configured workspace URL instead, and rediscover
-                           the iframe dynamically (container id changes each run).
+  * workspace recovery:   rebind an existing matching tab, or reopen the previously
+                           authorized workspace after a bridge restart. Verify the
+                           workspace identity before probing its Jupyter iframe.
   * async file-queue:      long jobs run detached (setsid) and are polled through
                            bounded shell reads, so no single call sits on the 60s
                            bridge ceiling.
@@ -528,7 +527,11 @@ def cdp(method, params=None, timeout=60):
 
 # ─────────────────────────── tab / iframe (navigate entry) ───────────────────────────
 def _walk(node, acc):
-    acc.append(node.get("frame", {}))
+    frame = dict(node.get("frame", {}))
+    # CDP reports hash routes separately from the document URL.
+    if frame.get("urlFragment"):
+        frame["url"] = (frame.get("url") or "").split("#", 1)[0] + "#" + frame["urlFragment"].lstrip("#")
+    acc.append(frame)
     for c in node.get("childFrames", []) or []:
         _walk(c, acc)
 
@@ -536,7 +539,7 @@ def _walk(node, acc):
 def get_frames():
     """Return (has_tab, [frame,...]). has_tab False if the session has no tab yet."""
     try:
-        tree = cdp("Page.getFrameTree")
+        tree = cdp("Page.getFrameTree", timeout=10)
     except Bridge as e:
         message = str(e).lower()
         if "no tab" in message or "tab was closed" in message:
@@ -561,50 +564,121 @@ def _iframe_id(frames):
 
 
 def _iframe_alive(fid):
-    """Reused tab may hold a DEAD container (workspace restarted). Verify api/status==200."""
+    """Read-only readiness probe; retain authentication and transport failure reasons."""
+    ctx = make_context(fid)
+    expr = (_runtime() + "\n;(async () => { return await window.__codexJupyter('probe', {}); })()")
+    res = cdp("Runtime.evaluate", {"expression": expr, "contextId": ctx,
+                                   "awaitPromise": True, "returnByValue": True, "userGesture": True},
+              timeout=10)
+    val = res.get("result", {}).get("value") or {}
+    data = val.get("data") or {}
+    statuses = [data.get(key) for key in ("status_code", "root_status", "work_status")]
+    if any(status in (401, 403) for status in statuses):
+        raise Bridge("jupyter_auth_required: Jupyter 登录或访问权限失效，请在 Edge 中检查登录状态")
+    if res.get("exceptionDetails") or not isinstance(data.get("status_code"), int):
+        raise Bridge("iframe_probe_failed: iframe 刷新、探查异常或未返回有效状态")
+    if not val.get("ok"):
+        raise Bridge(f"jupyter_unavailable: HTTP 状态 {statuses}; 工作区可能尚未启动完成")
+    return data.get("status_code") == 200
+
+
+def _same_workspace(url, target_url):
     try:
-        ctx = make_context(fid)
-        expr = (_runtime() + "\n;(async () => { return await window.__codexJupyter('probe', {}); })()")
-        res = cdp("Runtime.evaluate", {"expression": expr, "contextId": ctx,
-                                       "awaitPromise": True, "returnByValue": True, "userGesture": True})
-        val = res.get("result", {}).get("value") or {}
-        return (val.get("data", {}) or {}).get("status_code") == 200
-    except Bridge:
+        return _workspace_ids(url) == _workspace_ids(target_url)
+    except ValueError:
         return False
 
 
+def _workspace_frame(frames, target_url):
+    """The bridge's find_tab matches domains, so independently check both workspace IDs."""
+    outer_url = frames[0].get("url", "") if frames else ""
+    if not _same_workspace(outer_url, target_url):
+        if re.search(r"(?:/|#)(?:login|signin)(?:[/?#]|$)", outer_url, re.I):
+            raise Bridge("dcs_login_required: DCS 已进入登录页，请在原 Edge profile 中登录")
+        if outer_url not in ("", "about:blank"):
+            raise Bridge("workspace_mismatch: 当前标签页与已授权项目/工作区不一致；切换目标请使用 connect --url")
+        return None
+    for frame in frames[1:]:
+        parts = urlsplit(frame.get("url") or "")
+        if parts.hostname == "inner.dcs.cloud" and re.search(r"/(?:login|signin)(?:/|$)", parts.path):
+            raise Bridge("jupyter_auth_required: Jupyter iframe 已进入登录页")
+    return _iframe_id(frames)
+
+
 def ensure_iframe(navigate=False, settle=45, workspace_url=None, force_navigation=False):
-    # 1. reuse a live JupyterLab tab this session already owns (across chats, same daemon)
-    has, frames = get_frames()
-    fid = _iframe_id(frames)
-    if not force_navigation and fid and _iframe_alive(fid):
-        return fid
-    if not navigate:
-        raise Bridge("workspace_not_connected: 请先手动打开目标个性分析,等待启动完成,然后把当前 URL 提供给 `connect --url`")
-    # 2. navigate only to the URL explicitly supplied to this connect invocation.
-    target_url = workspace_url or ""
+    target_url = workspace_url or WORKSPACE_URL
     if not target_url:
         if WORKSPACE_URL_ERROR:
             raise Bridge(f"invalid_workspace_url: {WORKSPACE_URL_ERROR}")
-        raise Bridge(
-            "no_workspace_url: 没有可用的标签页。请让用户在 Edge 里打开自己的 "
-            "StereoNote workspace,复制地址栏完整 URL(形如 "
-            "https://www.dcs.cloud/stereonote/#/notebookEmbed?projectId=...&workspaceId=...),"
-            "然后 `python sn.py connect --url \"<粘贴的URL>\"`。")
+        raise Bridge("workspace_not_configured: 首次连接请提供目标工作区 URL 并使用 connect --url")
+    target_url = canonical_workspace_url(target_url)
+    has, frames = get_frames()
+    last_error = "browser_tab_missing"
+
+    def ready(current_frames):
+        nonlocal last_error
+        fid = _workspace_frame(current_frames, target_url)
+        if not fid:
+            last_error = "iframe_loading"
+            return None
+        try:
+            if _iframe_alive(fid):
+                return fid
+            last_error = "jupyter_unavailable"
+        except Bridge as exc:
+            if str(exc).startswith("jupyter_auth_required:"):
+                raise
+            last_error = str(exc).split(":", 1)[0]
+        return None
+
+    if not force_navigation:
+        # Retry only preparation probes, never a dispatched write/kernel/job operation.
+        for attempt in range(3):
+            if not has:
+                break
+            fid = ready(frames)
+            if fid:
+                return fid
+            if attempt < 2:
+                time.sleep(1)
+                has, frames = get_frames()
+        if not has:
+            for active in (False, True):
+                try:
+                    tab = command("find_tab", {"url": target_url, "active": active}, timeout=10)
+                except Bridge as exc:
+                    if str(exc).startswith("command_failed(find_tab):"):
+                        continue
+                    raise
+                if _same_workspace(tab.get("url", ""), target_url):
+                    has, frames = get_frames()
+                    fid = ready(frames) if has else None
+                    if fid:
+                        return fid
+                    break
+                # Never replace a borrowed tab belonging to another workspace/site.
+                has = False
+    elif frames and not _same_workspace(frames[0].get("url", ""), target_url):
+        has = False
+
+    # The target is an explicit connect URL or the last successfully authorized IDs.
     command("navigate", {"url": target_url, "newTab": (not has)}, timeout=60)
-    for _ in range(settle // 3):
-        time.sleep(3)
-        _, frames = get_frames()
-        fid = _iframe_id(frames)
-        if fid and _iframe_alive(fid):
+    deadline = time.monotonic() + settle
+    for _ in range(max(1, settle // 3)):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(3, remaining))
+        has, frames = get_frames()
+        fid = ready(frames) if has else None
+        if fid:
             return fid
-    raise Bridge("jupyter_iframe_not_found: workspace 可能还在启动/排队,或 URL 已过期需重新登录/重新粘贴 "
-                 "(workspaceId 每次可能变)。让用户复制当前 StereoNote 网址后 `connect --url \"<URL>\"`。")
+    raise Bridge(f"workspace_startup_timeout: 同一工作区恢复等待已结束；last_error={last_error}，请检查启动状态")
 
 
 def make_context(frame_id):
     res = cdp("Page.createIsolatedWorld",
-              {"frameId": frame_id, "worldName": "sn-v2", "grantUniveralAccess": True})
+              {"frameId": frame_id, "worldName": "sn-v2", "grantUniveralAccess": True}, timeout=10)
     ctx = res.get("executionContextId")
     if ctx is None:
         raise Bridge(f"no_execution_context: {json.dumps(res)[:200]}")

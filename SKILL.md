@@ -53,9 +53,9 @@ printed or returned. Only operation results should cross the bridge.
 The workspace address is runtime state because `projectId` and `workspaceId` vary by
 user/workspace.
 
-At the start of each browser/workspace session, ask the user to manually open the
-desired Personal Analysis workspace in their normal Edge profile, wait until it has
-started, and provide the current address-bar URL. Then run:
+For the first connection or an explicitly requested workspace change, ask the user
+to manually open the desired Personal Analysis workspace in their normal Edge
+profile, wait until it has started, and provide the current address-bar URL. Then run:
 
 ```bash
 python scripts/sn.py connect --url "<StereoNote workspace URL>"
@@ -66,8 +66,27 @@ URL, requires a live Jupyter probe, and only then stores `projectId` and `worksp
 in the **per-user config**. Failed connections do not replace the saved IDs. The
 complete URL and unrelated query/fragment parameters are never persisted.
 
-Only `connect --url` may create or replace the controlled browser tab. Other commands
-must reuse the live tab; if it is missing or closed, ask for the current URL again.
+After a successful connection, ordinary commands automatically recover the same
+saved workspace. They first reuse its live tab, retry transient readiness failures
+up to three times, then rebind an existing matching tab or reopen the canonical
+workspace URL reconstructed from the saved `projectId` and `workspaceId`.
+Page startup polling is bounded to 45 seconds after navigation. The controller
+checks both `projectId` and `workspaceId` before probing Jupyter; a domain-only
+`find_tab` match is insufficient. A borrowed tab for another workspace is never
+replaced. A live controlled tab showing a different workspace stops with
+`workspace_mismatch`; changing workspaces requires an explicit `connect --url`.
+
+If a daemon restart loses the tab association while saved workspace IDs are intact,
+run `probe` or the requested command directly; do not ask for the URL again.
+If the controller reports missing configuration or a requested workspace change,
+obtain the current URL. For authentication errors, ask the user to log in in the
+same Edge profile. A startup timeout means check workspace startup/queue state,
+not that its URL necessarily expired.
+
+Only connection preparation and read-only readiness probes are retried. Once a
+write, kernel execution or job submission has been dispatched, never automatically
+resend it after a bridge timeout: execution status may be unknown. Report that
+uncertainty and inspect available state before deciding what to do next.
 
 Default Windows config location:
 
@@ -226,10 +245,25 @@ a current status in that turn.
    explicit DCS/StereoNote operational intent or explicit skill invocation.
 9. For long jobs, submit once and stop after launch verification rather than polling
    continuously.
-10. Connect only to the current URL explicitly provided after the user opens the target
-    Personal Analysis workspace. Never guess or select another workspace.
+10. Initially connect only to the URL explicitly provided for the target Personal
+    Analysis workspace. Later recovery may reuse those successfully saved IDs only;
+    never guess, probe or execute in a different workspace.
 
 ## Failure reporting
+
+Connection errors have distinct prefixes:
+
+| Prefix | Action |
+|---|---|
+| `daemon_not_running` / `daemon_unreachable` | Check the local bridge service. |
+| `extension_not_connected` | Check Edge and its enabled extension. |
+| `workspace_not_configured` | Obtain the first/current target URL and connect. |
+| `workspace_mismatch` | Confirm the requested target; change it only with explicit `connect --url`. |
+| `dcs_login_required` / `jupyter_auth_required` | Log in or check permissions in the same Edge profile. |
+| `workspace_startup_timeout` | Check startup/queue state and the reported `last_error`. |
+
+`last_error` may identify `browser_tab_missing`, `iframe_loading`,
+`iframe_probe_failed`, `jupyter_unavailable`, or a transport failure.
 
 Report:
 
