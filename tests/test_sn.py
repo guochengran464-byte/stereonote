@@ -903,6 +903,41 @@ class ConnectionRecoveryTests(unittest.TestCase):
         self.assertLessEqual(alive.call_count, 4)
         self.assertEqual(sum(c.args[0] == "navigate" for c in command.call_args_list), 1)
 
+    def test_startup_probes_share_the_remaining_deadline(self):
+        for frame_delay, expected_calls in (
+                (4, [("Page.getFrameTree", 9), ("Page.createIsolatedWorld", 5), ("Runtime.evaluate", 1)]),
+                (9, [("Page.getFrameTree", 9)])):
+            now, navigated, calls = [0.0], [False], []
+            tree = {"frameTree": {"frame": self.frames[0],
+                                  "childFrames": [{"frame": self.frames[1]}]}}
+
+            def command(action, args, timeout=60):
+                self.assertEqual(action, "navigate")
+                navigated[0] = True
+                return {}
+
+            def cdp(method, params=None, timeout=60):
+                if navigated[0]:
+                    calls.append((method, timeout))
+                    delay = frame_delay if method == "Page.getFrameTree" else 4
+                    if method == "Runtime.evaluate":
+                        delay = 10
+                    now[0] += min(delay, timeout)
+                if method == "Page.getFrameTree":
+                    return tree
+                if method == "Page.createIsolatedWorld":
+                    return {"executionContextId": 1}
+                raise sn.Bridge("daemon_unreachable: read timed out")
+
+            with self.subTest(frame_delay=frame_delay), patch.object(sn, "WORKSPACE_URL", self.url), \
+                 patch.object(sn, "command", side_effect=command), patch.object(sn, "cdp", side_effect=cdp), \
+                 patch.object(sn.time, "monotonic", side_effect=lambda: now[0]), \
+                 patch.object(sn.time, "sleep", side_effect=lambda seconds: now.__setitem__(0, now[0] + seconds)):
+                with self.assertRaisesRegex(sn.Bridge, "workspace_startup_timeout"):
+                    sn.ensure_iframe(force_navigation=True, settle=12)
+                self.assertLessEqual(now[0], 12)
+                self.assertEqual(calls, expected_calls)
+
     def test_operation_timeout_after_dispatch_is_never_replayed(self):
         with patch.object(sn, "ensure_daemon"), patch.object(sn, "ensure_iframe", return_value="inner"), \
              patch.object(sn, "make_context", return_value=1), \

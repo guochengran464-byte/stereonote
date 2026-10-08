@@ -4,7 +4,7 @@
 
 - Recover the previously authorized workspace after loss of the bridge tab association, preferring an existing matching tab before reopening the URL reconstructed from its saved IDs.
 - Restore CDP's separate URL fragment before verifying both outer workspace IDs; reject another workspace and never replace an unrelated borrowed tab.
-- Retry read-only readiness checks up to three times and bound post-navigation startup polling; preserve separate authentication, identity, transport and startup errors.
+- Retry read-only readiness checks up to three times; frame discovery, context creation and readiness requests share the post-navigation startup deadline. Preserve separate authentication, identity, transport and startup errors.
 - Never replay a dispatched write, kernel execution or job submission after a bridge timeout.
 
 ## 3.2.1 - 2026-08-12
