@@ -622,8 +622,9 @@ class PublicReleaseSafetyTests(unittest.TestCase):
         self.assertIn("jupyter_probe_failed", source)
 
     def test_navigated_iframe_must_pass_live_probe_before_connect_succeeds(self):
-        frames = [{"id": "frame-1", "url": "https://inner.dcs.cloud/notebook/st/abc/"}]
         url = "https://www.dcs.cloud/stereonote/#/notebookEmbed?projectId=p&workspaceId=w"
+        frames = [{"id": "outer", "url": url},
+                  {"id": "frame-1", "url": "https://inner.dcs.cloud/notebook/st/abc/"}]
         with patch.object(sn, "get_frames", side_effect=[(False, []), (True, frames)]), \
              patch.object(sn, "_iframe_alive", return_value=True) as alive, \
              patch.object(sn, "command") as command, patch.object(sn.time, "sleep"):
@@ -786,6 +787,129 @@ class CliValidationTests(unittest.TestCase):
              patch.object(sn, "_print") as output:
             self.assertEqual(sn.main(["poll", "bad"]), 2)
         output.assert_called_once_with({"ok": False, "error": "invalid_job_id"})
+
+
+class ConnectionRecoveryTests(unittest.TestCase):
+    url = "https://www.dcs.cloud/stereonote/#/notebookEmbed?projectId=p&workspaceId=w"
+    frames = [{"id": "outer", "url": url},
+              {"id": "inner", "url": "https://inner.dcs.cloud/notebook/st/task-p/lab"}]
+
+    def test_cdp_separate_url_fragment_preserves_workspace_identity(self):
+        base, fragment = self.url.split("#", 1)
+        for fragment_workspace, expected in ((fragment, "inner"),
+                                              (fragment.replace("workspaceId=w", "workspaceId=other"), None)):
+            tree = {"frameTree": {"frame": {"id": "outer", "url": base,
+                                             "urlFragment": "#" + fragment_workspace},
+                                  "childFrames": [{"frame": self.frames[1]}]}}
+            with self.subTest(fragment=fragment_workspace), \
+                 patch.object(sn, "WORKSPACE_URL", self.url), patch.object(sn, "cdp", return_value=tree), \
+                 patch.object(sn, "_iframe_alive", return_value=True) as alive:
+                if expected:
+                    self.assertEqual(sn.ensure_iframe(), expected)
+                else:
+                    with self.assertRaisesRegex(sn.Bridge, "workspace_mismatch"):
+                        sn.ensure_iframe()
+                    alive.assert_not_called()
+
+    def test_missing_session_reopens_only_the_saved_workspace(self):
+        with patch.object(sn, "WORKSPACE_URL", self.url), \
+             patch.object(sn, "get_frames", side_effect=[(False, []), (True, self.frames)]), \
+             patch.object(sn, "_iframe_alive", return_value=True), \
+             patch.object(sn, "command", return_value={}) as command, patch.object(sn.time, "sleep"):
+            self.assertEqual(sn.ensure_iframe(settle=3), "inner")
+        navigations = [c for c in command.call_args_list if c.args[0] == "navigate"]
+        self.assertEqual(len(navigations), 1)
+        self.assertEqual(navigations[0].args[1], {"url": self.url, "newTab": True})
+
+    def test_existing_matching_tab_is_rebound_without_navigation(self):
+        with patch.object(sn, "WORKSPACE_URL", self.url), \
+             patch.object(sn, "get_frames", side_effect=[(False, []), (True, self.frames)]), \
+             patch.object(sn, "_iframe_alive", return_value=True), \
+             patch.object(sn, "command", return_value={"url": self.url, "tabId": 123}) as command:
+            self.assertEqual(sn.ensure_iframe(), "inner")
+        self.assertFalse(any(c.args[0] == "navigate" for c in command.call_args_list))
+
+    def test_brief_iframe_failure_retries_without_reloading_the_page(self):
+        with patch.object(sn, "WORKSPACE_URL", self.url), \
+             patch.object(sn, "get_frames", return_value=(True, self.frames)), \
+             patch.object(sn, "_iframe_alive", side_effect=[False, True]) as alive, \
+             patch.object(sn, "command") as command, patch.object(sn.time, "sleep"):
+            self.assertEqual(sn.ensure_iframe(), "inner")
+        self.assertEqual(alive.call_count, 2)
+        command.assert_not_called()
+
+    def test_other_workspace_is_rejected_before_any_jupyter_probe(self):
+        wrong = [dict(self.frames[0], url=self.url.replace("workspaceId=w", "workspaceId=other")),
+                 self.frames[1]]
+        with patch.object(sn, "WORKSPACE_URL", self.url), \
+             patch.object(sn, "get_frames", return_value=(True, wrong)), \
+             patch.object(sn, "_iframe_alive") as alive, patch.object(sn, "command") as command:
+            with self.assertRaisesRegex(sn.Bridge, "workspace_mismatch"):
+                sn.ensure_iframe()
+        alive.assert_not_called()
+        command.assert_not_called()
+
+    def test_missing_configuration_never_guesses_or_opens_a_workspace(self):
+        with patch.object(sn, "WORKSPACE_URL", ""), patch.object(sn, "WORKSPACE_URL_ERROR", None), \
+             patch.object(sn, "get_frames", return_value=(False, [])), \
+             patch.object(sn, "command") as command:
+            with self.assertRaisesRegex(sn.Bridge, "workspace_not_configured"):
+                sn.ensure_iframe()
+        command.assert_not_called()
+
+    def test_jupyter_authentication_failure_has_a_specific_error(self):
+        response = {"result": {"value": {"ok": False, "data": {"status_code": 403}}}}
+        with patch.object(sn, "make_context", return_value=1), \
+             patch.object(sn, "cdp", return_value=response):
+            with self.assertRaisesRegex(sn.Bridge, "jupyter_auth_required"):
+                sn._iframe_alive("inner")
+
+    def test_authentication_failure_is_not_retried_or_navigated_away(self):
+        with patch.object(sn, "WORKSPACE_URL", self.url), \
+             patch.object(sn, "get_frames", return_value=(True, self.frames)), \
+             patch.object(sn, "_iframe_alive", side_effect=sn.Bridge("jupyter_auth_required: HTTP 403")) as alive, \
+             patch.object(sn, "command") as command:
+            with self.assertRaisesRegex(sn.Bridge, "jupyter_auth_required"):
+                sn.ensure_iframe()
+        self.assertEqual(alive.call_count, 1)
+        command.assert_not_called()
+
+    def test_domain_only_tab_match_cannot_replace_a_different_workspace(self):
+        other_url = self.url.replace("workspaceId=w", "workspaceId=other")
+        with patch.object(sn, "WORKSPACE_URL", self.url), \
+             patch.object(sn, "get_frames", side_effect=[(False, []), (True, self.frames)]), \
+             patch.object(sn, "_iframe_alive", return_value=True), \
+             patch.object(sn, "command", return_value={"url": other_url}) as command, \
+             patch.object(sn.time, "sleep"):
+            self.assertEqual(sn.ensure_iframe(settle=3), "inner")
+        navigation = next(c for c in command.call_args_list if c.args[0] == "navigate")
+        self.assertEqual(navigation.args[1], {"url": self.url, "newTab": True})
+
+    def test_dcs_login_page_is_reported_without_probing_jupyter(self):
+        with patch.object(sn, "WORKSPACE_URL", self.url), \
+             patch.object(sn, "get_frames", return_value=(True, [{"url": "https://www.dcs.cloud/login"}])), \
+             patch.object(sn, "_iframe_alive") as alive:
+            with self.assertRaisesRegex(sn.Bridge, "dcs_login_required"):
+                sn.ensure_iframe()
+        alive.assert_not_called()
+
+    def test_startup_wait_is_bounded_and_does_not_report_url_expiry(self):
+        with patch.object(sn, "WORKSPACE_URL", self.url), \
+             patch.object(sn, "get_frames", return_value=(True, self.frames)), \
+             patch.object(sn, "_iframe_alive", return_value=False) as alive, \
+             patch.object(sn, "command") as command, patch.object(sn.time, "sleep"):
+            with self.assertRaisesRegex(sn.Bridge, "workspace_startup_timeout"):
+                sn.ensure_iframe(settle=3)
+        self.assertLessEqual(alive.call_count, 4)
+        self.assertEqual(sum(c.args[0] == "navigate" for c in command.call_args_list), 1)
+
+    def test_operation_timeout_after_dispatch_is_never_replayed(self):
+        with patch.object(sn, "ensure_daemon"), patch.object(sn, "ensure_iframe", return_value="inner"), \
+             patch.object(sn, "make_context", return_value=1), \
+             patch.object(sn, "cdp", side_effect=sn.Bridge("daemon_unreachable: read timed out")) as cdp:
+            with self.assertRaises(sn.Bridge):
+                sn.evaluate_op("run_python", {"code": "print(1)"})
+        self.assertEqual(cdp.call_count, 1)
 
 
 if __name__ == "__main__":

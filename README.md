@@ -82,7 +82,7 @@ DCS/StereoNote**，而不是看到普通的 `/data/work` 路径就自动触发�
 python scripts/sn.py doctor
 ```
 
-每次开始新的浏览器/工作区会话时：
+首次连接，或者需要切换工作区时：
 
 1. 在自己的 Edge 中手动打开目标“个性分析”。
 2. 等待工作区启动完成。
@@ -93,7 +93,7 @@ python scripts/sn.py doctor
 python scripts/sn.py connect --url "<当前 StereoNote workspace URL>"
 ```
 
-v3.2.1 只会导航到本次明确提供的 URL，并在 Jupyter 探针成功后才保存
+首次连接只会导航到本次明确提供的 URL，并在 Jupyter 探针成功后才保存
 `projectId` 和 `workspaceId`。连接失败不会污染旧配置，完整 URL 不会写进 Git 仓库。
 
 Windows 默认配置位置：
@@ -105,8 +105,15 @@ Windows 默认配置位置：
 因此不同用户可以共用同一份 Git 仓库，而不会互相覆盖 workspace 配置，也不容易把
 个人 workspace URL 误提交到 GitHub。
 
-`connect --url` 是唯一允许创建或替换受控浏览器标签页的命令。其他命令发现标签页
-缺失时会要求重新提供当前 URL，不会根据旧配置偷偷打开工作区。
+连接成功后，普通命令可以自动恢复同一个已保存的工作区：优先复用标签页，短暂探查
+失败最多重试三次，标签页关联丢失时重新绑定已有页面，找不到时用保存的项目和工作区 ID
+重建地址并打开同一工作区。
+导航后的启动等待上限为 45 秒。每次操作前都会核对项目和工作区 ID；不会因为域名
+相同就接入另一个工作区。首次连接和切换目标仍使用 `connect --url`。
+
+错误会区分本地桥接服务、插件连接、工作区身份、登录权限和启动超时。守护进程
+重启后已有配置仍有效时，直接运行 `probe` 即可尝试恢复，无需再次粘贴 URL。
+写文件、代码执行或任务提交已经发出后，结果超时不会自动重发，以免重复执行。
 
 ## 常用命令
 
@@ -223,7 +230,7 @@ $SN_ARTIFACT_DIR
 - shell/Jupyter/文本/目录输出增加边界，避免超大输出吞内存或上下文。
 - 大型 artifact 跳过默认全文件 SHA-256。
 - Codex 通过官方 `agents/openai.yaml` 关闭隐式 Skill 调用。
-- 只有 `connect --url` 能导航，并且只使用用户本次明确提供的工作区 URL。
+- 首次连接/切换工作区必须使用 `connect --url`；连接恢复仅使用此前成功保存的同一工作区 ID。
 - WebBridge 地址强制限制为带显式端口的本机 loopback HTTP 地址。
 - iframe origin/path 使用严格匹配，后台任务状态使用 `umask 077`。
 - 新增 `doctor` 预检、CI、LICENSE、SECURITY、CHANGELOG 和 release checklist。
@@ -255,7 +262,7 @@ no-clobber 约束、workspace URL 去敏、large-artifact hash 策略，以及 P
 本版本按“先公开、持续维护”的方式发布，以下事项保留为后续版本维护记录：
 
 - Codex 已通过 `agents/openai.yaml` 硬关闭隐式调用；Claude Code 当前主要依赖 Skill 描述中的显式调用约束，尚未提供独立的 Claude 专用 metadata 包。
-- 当前会严格验证 DCS Jupyter iframe 的 origin/path，但尚未把每次特权操作与最初连接的 workspace identity 做强绑定；切换工作区后应重新执行 `connect --url`。
+- 每次操作会校验外层项目/工作区 ID 和内层 Jupyter origin/path；切换目标请使用 `connect --url`。归档脚本等外部调用仍需正确设置自己的 `SN_CONFIG_DIR` / `SN_SESSION`，以避免多个独立任务共享配置。
 - DCS 默认 ACL 曾使 `umask 077` 产生比预期更宽的权限；v3.2.1 已增加显式 `chmod 700/600`，但修复后的 detached-job 权限路径仍建议在更多真实容器中继续回归验证。
 
 完整发布审计见 [`docs/RELEASE_AUDIT_v3.2.1.md`](docs/RELEASE_AUDIT_v3.2.1.md)。这些限制不会被隐藏，后续修复将记录在 `CHANGELOG.md`。
