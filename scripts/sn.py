@@ -536,10 +536,17 @@ def _walk(node, acc):
         _walk(c, acc)
 
 
-def get_frames():
+def _probe_timeout(deadline):
+    remaining = 10 if deadline is None else deadline - time.monotonic()
+    if remaining <= 0:
+        raise Bridge("workspace_startup_timeout: 启动探查总等待时间已耗尽")
+    return min(10, remaining)
+
+
+def get_frames(deadline=None):
     """Return (has_tab, [frame,...]). has_tab False if the session has no tab yet."""
     try:
-        tree = cdp("Page.getFrameTree", timeout=10)
+        tree = cdp("Page.getFrameTree", timeout=_probe_timeout(deadline))
     except Bridge as e:
         message = str(e).lower()
         if "no tab" in message or "tab was closed" in message:
@@ -563,13 +570,13 @@ def _iframe_id(frames):
     return None
 
 
-def _iframe_alive(fid):
+def _iframe_alive(fid, deadline=None):
     """Read-only readiness probe; retain authentication and transport failure reasons."""
-    ctx = make_context(fid)
+    ctx = make_context(fid, deadline=deadline)
     expr = (_runtime() + "\n;(async () => { return await window.__codexJupyter('probe', {}); })()")
     res = cdp("Runtime.evaluate", {"expression": expr, "contextId": ctx,
                                    "awaitPromise": True, "returnByValue": True, "userGesture": True},
-              timeout=10)
+              timeout=_probe_timeout(deadline))
     val = res.get("result", {}).get("value") or {}
     data = val.get("data") or {}
     statuses = [data.get(key) for key in ("status_code", "root_status", "work_status")]
@@ -615,14 +622,14 @@ def ensure_iframe(navigate=False, settle=45, workspace_url=None, force_navigatio
     has, frames = get_frames()
     last_error = "browser_tab_missing"
 
-    def ready(current_frames):
+    def ready(current_frames, deadline=None):
         nonlocal last_error
         fid = _workspace_frame(current_frames, target_url)
         if not fid:
             last_error = "iframe_loading"
             return None
         try:
-            if _iframe_alive(fid):
+            if _iframe_alive(fid, deadline=deadline):
                 return fid
             last_error = "jupyter_unavailable"
         except Bridge as exc:
@@ -669,16 +676,17 @@ def ensure_iframe(navigate=False, settle=45, workspace_url=None, force_navigatio
         if remaining <= 0:
             break
         time.sleep(min(3, remaining))
-        has, frames = get_frames()
-        fid = ready(frames) if has else None
+        has, frames = get_frames(deadline=deadline)
+        fid = ready(frames, deadline=deadline) if has else None
         if fid:
             return fid
     raise Bridge(f"workspace_startup_timeout: 同一工作区恢复等待已结束；last_error={last_error}，请检查启动状态")
 
 
-def make_context(frame_id):
+def make_context(frame_id, deadline=None):
     res = cdp("Page.createIsolatedWorld",
-              {"frameId": frame_id, "worldName": "sn-v2", "grantUniveralAccess": True}, timeout=10)
+              {"frameId": frame_id, "worldName": "sn-v2", "grantUniveralAccess": True},
+              timeout=_probe_timeout(deadline))
     ctx = res.get("executionContextId")
     if ctx is None:
         raise Bridge(f"no_execution_context: {json.dumps(res)[:200]}")
